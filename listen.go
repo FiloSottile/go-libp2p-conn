@@ -24,6 +24,7 @@ import (
 const (
 	SecioTag        = "/secio/1.0.0"
 	NoEncryptionTag = "/plaintext/1.0.0"
+	TLS12Tag        = "/tls/1.2.0"
 )
 
 var connAcceptBuffer = 32
@@ -176,8 +177,8 @@ func (l *listener) handleIncoming() {
 					conn = l.wrapper(conn)
 				}
 
-				// Negotiate secio (or no secio).
-				_, _, err = l.mux.Negotiate(conn)
+				// Negotiate secio / TLS / plaintext.
+				proto, _, err := l.mux.Negotiate(conn)
 				if err != nil {
 					conn.Close()
 					log.Warning("incoming conn: negotiation of crypto protocol failed: ", err)
@@ -186,7 +187,13 @@ func (l *listener) handleIncoming() {
 
 				insecureConn := newSingleConn(ctx, l.local, "", conn)
 
-				if l.privk != nil && iconn.EncryptConnections {
+				if l.privk != nil && iconn.EncryptConnections && proto == NoEncryptionTag {
+					panic("selected plaintext when not allowed")
+				}
+				log.Debugf("listener %v selected protocol: %s", l, proto)
+
+				switch proto {
+				case SecioTag:
 					secureConn, err := newSecureConn(ctx, l.privk, insecureConn)
 					if err != nil {
 						conn.Close()
@@ -194,8 +201,16 @@ func (l *listener) handleIncoming() {
 						return
 					}
 					conn = secureConn
-				} else {
-					log.Warning("listener %s listening INSECURELY!", l)
+				case TLS12Tag:
+					tlsConn, err := newTLSConn(ctx, l.privk, insecureConn, false)
+					if err != nil {
+						conn.Close()
+						log.Infof("ignoring conn we failed to secure: %s %s", err, insecureConn)
+						return
+					}
+					conn = tlsConn
+				case NoEncryptionTag:
+					log.Warningf("listener %v listening INSECURELY!", l)
 					conn = insecureConn
 				}
 
@@ -275,6 +290,7 @@ func WrapTransportListenerWithProtector(ctx context.Context, ml transport.Listen
 	}
 
 	if iconn.EncryptConnections && sk != nil {
+		l.mux.AddHandler(TLS12Tag, nil)
 		l.mux.AddHandler(SecioTag, nil)
 	} else {
 		l.mux.AddHandler(NoEncryptionTag, nil)

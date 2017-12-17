@@ -121,14 +121,17 @@ func (d *Dialer) Dial(ctx context.Context, raddr ma.Multiaddr, remote peer.ID) (
 		maconn = d.Wrapper(maconn)
 	}
 
-	cryptoProtoChoice := SecioTag
+	proto := []string{TLS12Tag, SecioTag}
 	if !iconn.EncryptConnections || d.PrivateKey == nil {
-		cryptoProtoChoice = NoEncryptionTag
+		proto = []string{NoEncryptionTag}
 	}
 
+	var selectedProto string
 	selectResult := make(chan error, 1)
 	go func() {
-		selectResult <- msmux.SelectProtoOrFail(cryptoProtoChoice, maconn)
+		p, err := msmux.SelectOneOf(proto, maconn)
+		selectedProto = p
+		selectResult <- err
 	}()
 	select {
 	case <-ctx.Done():
@@ -138,28 +141,45 @@ func (d *Dialer) Dial(ctx context.Context, raddr ma.Multiaddr, remote peer.ID) (
 			return nil, err
 		}
 	}
+	log.Debugf("dialer %s selected protocol: %s", d, selectedProto)
+	logdial["protocol"] = selectedProto
 
 	c = newSingleConn(ctx, d.LocalPeer, remote, maconn)
-	if d.PrivateKey == nil || !iconn.EncryptConnections {
-		log.Warning("dialer %s dialing INSECURELY %s at %s!", d, remote, raddr)
-		return c, nil
-	}
 
-	c2, err := newSecureConn(ctx, d.PrivateKey, c)
-	if err != nil {
-		c.Close()
-		return nil, err
+	switch selectedProto {
+	case NoEncryptionTag:
+		if d.PrivateKey != nil && iconn.EncryptConnections {
+			panic("illegal plaintext negotiation")
+		}
+		log.Warningf("dialer %s dialing INSECURELY %s at %s!", d, remote, raddr)
+		return c, nil
+	case TLS12Tag:
+		c2, err := newTLSConn(ctx, d.PrivateKey, c, true)
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
+		c = c2
+	case SecioTag:
+		c2, err := newSecureConn(ctx, d.PrivateKey, c)
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
+		c = c2
+	default:
+		panic("msmux selected an unsupported protocol")
 	}
 
 	// if the connection is not to whom we thought it would be...
-	connRemote := c2.RemotePeer()
+	connRemote := c.RemotePeer()
 	if connRemote != remote {
-		c2.Close()
+		c.Close()
 		return nil, fmt.Errorf("misdial to %s through %s (got %s): %s", remote, raddr, connRemote, err)
 	}
 
 	logdial["dial"] = "success"
-	return c2, nil
+	return c, nil
 }
 
 // AddDialer adds a sub-dialer usable by this dialer.
