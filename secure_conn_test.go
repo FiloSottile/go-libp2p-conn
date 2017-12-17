@@ -3,6 +3,7 @@ package conn
 import (
 	"bytes"
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
@@ -10,39 +11,42 @@ import (
 
 	ic "github.com/libp2p/go-libp2p-crypto"
 	iconn "github.com/libp2p/go-libp2p-interface-conn"
+	peer "github.com/libp2p/go-libp2p-peer"
 	travis "github.com/libp2p/go-testutil/ci/travis"
 )
 
-func upgradeToSecureConn(t *testing.T, ctx context.Context, sk ic.PrivKey, c iconn.Conn) (iconn.Conn, error) {
-	if c, ok := c.(*secureConn); ok {
-		return c, nil
+func secureHandshake(ctx context.Context, sk ic.PrivKey, c *iconn.Conn, done chan error, tls, client bool) {
+	if _, ok := (*c).(*secureConn); ok {
+		done <- errors.New("already a secure connection")
+		return
+	}
+	if _, ok := (*c).(*tlsConn); ok {
+		done <- errors.New("already a TLS connection")
+		return
 	}
 
-	// shouldn't happen, because dial + listen already return secure conns.
-	s, err := newSecureConn(ctx, sk, c)
+	var err error
+	var sc iconn.Conn
+	if tls {
+		sc, err = newTLSConn(ctx, sk, *c, client)
+	} else {
+		sc, err = newSecureConn(ctx, sk, *c)
+	}
 	if err != nil {
-		return nil, err
+		done <- err
+		return
 	}
 
-	// need to read + write, as that's what triggers the handshake.
-	h := []byte("hello")
-	if _, err := s.Write(h); err != nil {
-		return nil, err
+	if err := sayHello(sc); err != nil {
+		done <- err
+		return
 	}
-	if _, err := s.Read(h); err != nil {
-		return nil, err
-	}
-	return s, nil
+
+	*c = sc
+	done <- nil
 }
 
-func secureHandshake(t *testing.T, ctx context.Context, sk ic.PrivKey, c iconn.Conn, done chan error) {
-	_, err := upgradeToSecureConn(t, ctx, sk, c)
-	done <- err
-}
-
-func TestSecureSimple(t *testing.T) {
-	// t.Skip("Skipping in favor of another test")
-
+func testSecureSimple(t *testing.T, tls bool) {
 	numMsgs := 100
 	if testing.Short() {
 		numMsgs = 10
@@ -52,13 +56,26 @@ func TestSecureSimple(t *testing.T) {
 	c1, c2, p1, p2 := setupSingleConn(t, ctx)
 
 	done := make(chan error)
-	go secureHandshake(t, ctx, p1.PrivKey, c1, done)
-	go secureHandshake(t, ctx, p2.PrivKey, c2, done)
+	go secureHandshake(ctx, p1.PrivKey, &c1, done, tls, true)
+	go secureHandshake(ctx, p2.PrivKey, &c2, done, tls, false)
 
 	for i := 0; i < 2; i++ {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
+	}
+
+	if c1.RemotePeer() != c2.LocalPeer() {
+		t.Error("remote/local peer mismatch")
+	}
+	if c2.RemotePeer() != c1.LocalPeer() {
+		t.Error("remote/local peer mismatch")
+	}
+	if p, _ := peer.IDFromPublicKey(c1.RemotePublicKey()); p != c1.RemotePeer() {
+		t.Error("wrong RemotePublicKey")
+	}
+	if p, _ := peer.IDFromPublicKey(c2.RemotePublicKey()); p != c2.RemotePeer() {
+		t.Error("wrong RemotePublicKey")
 	}
 
 	for i := 0; i < numMsgs; i++ {
@@ -70,15 +87,22 @@ func TestSecureSimple(t *testing.T) {
 	c2.Close()
 }
 
-func TestSecureClose(t *testing.T) {
-	// t.Skip("Skipping in favor of another test")
+func TestSecureSimple(t *testing.T) {
+	t.Run("secio", func(t *testing.T) {
+		testSecureSimple(t, false)
+	})
+	t.Run("tls", func(t *testing.T) {
+		testSecureSimple(t, true)
+	})
+}
 
+func testSecureClose(t *testing.T, tls bool) {
 	ctx := context.Background()
 	c1, c2, p1, p2 := setupSingleConn(t, ctx)
 
 	done := make(chan error)
-	go secureHandshake(t, ctx, p1.PrivKey, c1, done)
-	go secureHandshake(t, ctx, p2.PrivKey, c2, done)
+	go secureHandshake(ctx, p1.PrivKey, &c1, done, tls, true)
+	go secureHandshake(ctx, p2.PrivKey, &c2, done, tls, false)
 
 	for i := 0; i < 2; i++ {
 		if err := <-done; err != nil {
@@ -97,35 +121,50 @@ func TestSecureClose(t *testing.T) {
 
 }
 
-func TestSecureCancelHandshake(t *testing.T) {
-	// t.Skip("Skipping in favor of another test")
+func TestSecureClose(t *testing.T) {
+	t.Run("secio", func(t *testing.T) {
+		testSecureClose(t, false)
+	})
+	t.Run("tls", func(t *testing.T) {
+		testSecureClose(t, true)
+	})
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	c1, c2, p1, p2 := setupSingleConn(t, ctx)
+func testSecureCancelHandshake(t *testing.T, tls bool) {
+	for _, client := range []bool{true, false} {
+		ctx, cancel := context.WithCancel(context.Background())
+		c1, c2, p1, _ := setupSingleConn(t, ctx)
 
-	done := make(chan error)
-	go secureHandshake(t, ctx, p1.PrivKey, c1, done)
-	time.Sleep(time.Millisecond)
-	cancel() // cancel ctx
-	go secureHandshake(t, ctx, p2.PrivKey, c2, done)
+		done := make(chan error)
+		go secureHandshake(ctx, p1.PrivKey, &c1, done, tls, client)
+		time.Sleep(time.Millisecond)
+		cancel() // cancel ctx
 
-	for i := 0; i < 2; i++ {
 		if err := <-done; err == nil {
 			t.Error("cancel should've errored out")
 		}
+
+		c2.Close()
 	}
 }
 
-func TestSecureHandshakeFailsWithWrongKeys(t *testing.T) {
-	// t.Skip("Skipping in favor of another test")
+func TestSecureCancelHandshake(t *testing.T) {
+	t.Run("secio", func(t *testing.T) {
+		testSecureCancelHandshake(t, false)
+	})
+	t.Run("tls", func(t *testing.T) {
+		testSecureCancelHandshake(t, true)
+	})
+}
 
+func testSecureHandshakeFailsWithWrongKeys(t *testing.T, tls bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	c1, c2, p1, p2 := setupSingleConn(t, ctx)
 
 	done := make(chan error)
-	go secureHandshake(t, ctx, p2.PrivKey, c1, done)
-	go secureHandshake(t, ctx, p1.PrivKey, c2, done)
+	go secureHandshake(ctx, p2.PrivKey, &c1, done, tls, true)
+	go secureHandshake(ctx, p1.PrivKey, &c2, done, tls, false)
 
 	for i := 0; i < 2; i++ {
 		if err := <-done; err == nil {
@@ -134,9 +173,16 @@ func TestSecureHandshakeFailsWithWrongKeys(t *testing.T) {
 	}
 }
 
-func TestSecureCloseLeak(t *testing.T) {
-	// t.Skip("Skipping in favor of another test")
+func TestSecureHandshakeFailsWithWrongKeys(t *testing.T) {
+	t.Run("secio", func(t *testing.T) {
+		testSecureHandshakeFailsWithWrongKeys(t, false)
+	})
+	t.Run("tls", func(t *testing.T) {
+		testSecureHandshakeFailsWithWrongKeys(t, true)
+	})
+}
 
+func TestSecureCloseLeak(t *testing.T) {
 	if testing.Short() {
 		t.SkipNow()
 	}
