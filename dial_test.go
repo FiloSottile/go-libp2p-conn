@@ -3,6 +3,7 @@ package conn
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -59,11 +60,11 @@ func echo(c iconn.Conn) {
 }
 
 func setupSecureConn(t *testing.T, ctx context.Context) (a, b iconn.Conn, p1, p2 tu.PeerNetParams) {
-	return setupConn(t, ctx, true)
+	return setupConn(t, ctx, false, true)
 }
 
 func setupSingleConn(t *testing.T, ctx context.Context) (a, b iconn.Conn, p1, p2 tu.PeerNetParams) {
-	return setupConn(t, ctx, false)
+	return setupConn(t, ctx, false, false)
 }
 
 func Listen(ctx context.Context, addr ma.Multiaddr, local peer.ID, sk ic.PrivKey) (iconn.Listener, error) {
@@ -85,10 +86,25 @@ func dialer(t *testing.T, a ma.Multiaddr) transport.Dialer {
 	return tptd
 }
 
-func setupConn(t *testing.T, ctx context.Context, secure bool) (a, b iconn.Conn, p1, p2 tu.PeerNetParams) {
+func randEdPeerNetParams(t *testing.T) tu.PeerNetParams {
+	var p tu.PeerNetParams
+	var err error
+	p.Addr = tu.ZeroLocalTCPAddress
+	p.PrivKey, p.PubKey, err = ic.GenerateKeyPairWithReader(ic.Ed25519, 0, rand.Reader)
+	fatalIfErr(t, err)
+	p.ID, err = peer.IDFromPublicKey(p.PubKey)
+	fatalIfErr(t, err)
+	return p
+}
 
-	p1 = tu.RandPeerNetParamsOrFatal(t)
-	p2 = tu.RandPeerNetParamsOrFatal(t)
+func setupConn(t *testing.T, ctx context.Context, ed, secure bool) (a, b iconn.Conn, p1, p2 tu.PeerNetParams) {
+	if ed {
+		p1 = randEdPeerNetParams(t)
+		p2 = randEdPeerNetParams(t)
+	} else {
+		p1 = tu.RandPeerNetParamsOrFatal(t)
+		p2 = tu.RandPeerNetParamsOrFatal(t)
+	}
 
 	key1 := p1.PrivKey
 	key2 := p2.PrivKey
@@ -138,7 +154,7 @@ func setupConn(t *testing.T, ctx context.Context, secure bool) (a, b iconn.Conn,
 	// if secure, need to read + write, as that's what triggers the handshake.
 	if secure {
 		if err := sayHello(c1); err != nil {
-			done <- err
+			t.Fatal(err)
 		}
 	}
 
@@ -382,6 +398,7 @@ func TestFailedAccept(t *testing.T) {
 		con2, err := d.Dial(ctx, l1.Multiaddr(), p1.ID)
 		if err != nil {
 			t.Error("msmux select failed: ", err)
+			return
 		}
 		con2.Close()
 	}()
@@ -426,6 +443,7 @@ func TestHangingAccept(t *testing.T) {
 		con2, err := d.Dial(ctx, l1.Multiaddr(), p1.ID)
 		if err != nil {
 			t.Error("msmux select failed: ", err)
+			return
 		}
 		defer con2.Close()
 
@@ -484,7 +502,6 @@ func TestConcurrentAccept(t *testing.T) {
 
 			maconn, err := d.DialContext(ctx, p1.Addr)
 			if err != nil {
-				log.Error(err)
 				t.Error("first dial failed: ", err)
 				return
 			}
@@ -587,7 +604,6 @@ func TestConnectionTimeouts(t *testing.T) {
 			d := NewDialer(p.ID, p.PrivKey, nil)
 			con, err := d.Dial(ctx, l1.Multiaddr(), p1.ID)
 			if err != nil {
-				log.Error(err)
 				t.Error("dial failed: ", err)
 				return
 			}
@@ -616,8 +632,8 @@ func TestConnectionTimeouts(t *testing.T) {
 		d := NewDialer(p.ID, p.PrivKey, nil)
 		con, err := d.Dial(ctx, l1.Multiaddr(), p1.ID)
 		if err != nil {
-			log.Error(err)
 			t.Error("dial failed: ", err)
+			wg.Done()
 			return
 		}
 		con.Close()

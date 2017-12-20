@@ -4,13 +4,16 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/tls"  // TODO: tris
-	"crypto/x509" // TODO: ed25519
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"golang_org/x/crypto/ed25519"
 	"math/big"
 	"time"
 
+	proto "github.com/gogo/protobuf/proto"
 	ic "github.com/libp2p/go-libp2p-crypto"
+	pb "github.com/libp2p/go-libp2p-crypto/pb"
 	iconn "github.com/libp2p/go-libp2p-interface-conn"
 	peer "github.com/libp2p/go-libp2p-peer"
 	tpt "github.com/libp2p/go-libp2p-transport"
@@ -70,7 +73,9 @@ func newTLSConn(ctx context.Context, sk ic.PrivKey, insecure iconn.Conn, client 
 		},
 		SessionTicketsDisabled: true,
 		MinVersion:             tls.VersionTLS12,
-		CurvePreferences:       []tls.CurveID{tls.CurveP256, tls.X25519},
+		// MinVersion:             tls.VersionTLS13,
+		// MaxVersion:             tls.VersionTLS13,
+		CurvePreferences: []tls.CurveID{tls.CurveP256, tls.X25519},
 	}
 	if client {
 		conn.Conn = tls.Client(insecure, config)
@@ -157,16 +162,29 @@ func keyToCertificate(sk ic.PrivKey) (*tls.Certificate, error) {
 	tmpl.ExtKeyUsage = append(tmpl.ExtKeyUsage, x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth)
 	p, _ := peer.IDFromPrivateKey(sk)
 	tmpl.Subject.CommonName = p.Pretty()
+
 	var publicKey, privateKey interface{}
-	switch sk := sk.(type) {
-	case *ic.RsaPrivateKey:
+	keyBytes, err := sk.Bytes()
+	if err != nil {
+		return nil, err
+	}
+	pbmes := new(pb.PrivateKey)
+	if err := proto.Unmarshal(keyBytes, pbmes); err != nil {
+		return nil, err
+	}
+	switch pbmes.GetType() {
+	case pb.KeyType_RSA:
 		tmpl.SignatureAlgorithm = x509.SHA256WithRSA
-		k, err := x509.ParsePKCS1PrivateKey(ic.MarshalRsaPrivateKey(sk))
+		k, err := x509.ParsePKCS1PrivateKey(pbmes.GetData())
 		if err != nil {
 			return nil, err
 		}
 		publicKey = &k.PublicKey
 		privateKey = k
+	case pb.KeyType_Ed25519:
+		tmpl.SignatureAlgorithm = x509.PureEd25519
+		privateKey = ed25519.PrivateKey(pbmes.GetData()[:ed25519.PrivateKeySize])
+		publicKey = ed25519.PublicKey(pbmes.GetData()[ed25519.PrivateKeySize:])
 	default:
 		return nil, errors.New("unsupported key type for TLS")
 	}
@@ -188,6 +206,12 @@ func certificateToKey(cert *x509.Certificate) (ic.PubKey, error) {
 			return nil, err
 		}
 		k, err := ic.UnmarshalRsaPublicKey(der)
+		if err != nil {
+			return nil, err
+		}
+		return k, nil
+	case ed25519.PublicKey:
+		k, err := ic.UnmarshalEd25519PublicKey(pk)
 		if err != nil {
 			return nil, err
 		}

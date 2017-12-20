@@ -175,7 +175,7 @@ func (d *Dialer) Dial(ctx context.Context, raddr ma.Multiaddr, remote peer.ID) (
 	connRemote := c.RemotePeer()
 	if connRemote != remote {
 		c.Close()
-		return nil, fmt.Errorf("misdial to %s through %s (got %s): %s", remote, raddr, connRemote, err)
+		return nil, fmt.Errorf("misdial to %s through %s (got %s)", remote, raddr, connRemote)
 	}
 
 	logdial["dial"] = "success"

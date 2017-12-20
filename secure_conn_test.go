@@ -46,14 +46,14 @@ func secureHandshake(ctx context.Context, sk ic.PrivKey, c *iconn.Conn, done cha
 	done <- nil
 }
 
-func testSecureSimple(t *testing.T, tls bool) {
+func testSecureSimple(t *testing.T, ed, tls bool) {
 	numMsgs := 100
 	if testing.Short() {
 		numMsgs = 10
 	}
 
 	ctx := context.Background()
-	c1, c2, p1, p2 := setupSingleConn(t, ctx)
+	c1, c2, p1, p2 := setupConn(t, ctx, ed, false)
 
 	done := make(chan error)
 	go secureHandshake(ctx, p1.PrivKey, &c1, done, tls, true)
@@ -88,11 +88,18 @@ func testSecureSimple(t *testing.T, tls bool) {
 }
 
 func TestSecureSimple(t *testing.T) {
-	t.Run("secio", func(t *testing.T) {
-		testSecureSimple(t, false)
+	t.Run("secio/RSA", func(t *testing.T) {
+		testSecureSimple(t, false, false)
 	})
-	t.Run("tls", func(t *testing.T) {
-		testSecureSimple(t, true)
+	t.Run("secio/Ed25519", func(t *testing.T) {
+		testSecureSimple(t, true, false)
+	})
+	t.Run("tls/RSA", func(t *testing.T) {
+		testSecureSimple(t, false, true)
+	})
+	t.Run("tls/Ed25519", func(t *testing.T) {
+		t.Skip("Ed25519 is only supported by TLS 1.3")
+		testSecureSimple(t, true, true)
 	})
 }
 
